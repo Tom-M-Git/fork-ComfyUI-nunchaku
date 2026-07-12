@@ -23,6 +23,8 @@ from nunchaku.models.linear import SVDQW4A4Linear
 from nunchaku.ops.gemm import svdq_gemm_w4a4_cuda
 from nunchaku.utils import pad_tensor
 
+from comfy import model_management
+
 
 def add_comfy_cast_weights_attr(svdq_linear: SVDQW4A4Linear, comfy_linear: nn.Linear):
     """
@@ -45,27 +47,32 @@ def resolve_linear_dtype_device(
     device: torch.device | str | None = None,
 ) -> tuple[torch.dtype, torch.device | str]:
     """
-    Resolve dtype/device from a possibly lazily initialized ComfyUI linear layer.
+    Resolve dtype and device from a possibly lazily initialized ComfyUI
+    linear layer.
 
-    On recent Windows ComfyUI builds, manual-cast linears may be created with
-    `weight=None` until the state dict is loaded.
+    With Windows AIMDO/deferred loading, ``weight`` may still be None when
+    Nunchaku replaces the original linear module.
     """
     weight = getattr(comfy_linear, "weight", None)
-    bias = getattr(comfy_linear, "bias", None)
 
     if torch_dtype is None:
         if weight is not None:
             torch_dtype = weight.dtype
         else:
-            torch_dtype = getattr(comfy_linear, "weight_comfy_model_dtype", torch.bfloat16)
+            torch_dtype = getattr(
+                comfy_linear,
+                "weight_comfy_model_dtype",
+                None,
+            )
+
+            if not isinstance(torch_dtype, torch.dtype):
+                torch_dtype = torch.bfloat16
 
     if device is None:
         if weight is not None:
             device = weight.device
-        elif bias is not None:
-            device = bias.device
         else:
-            device = torch.device("cpu")
+            device = model_management.get_torch_device()
 
     return torch_dtype, device
 
@@ -90,9 +97,15 @@ def fuse_to_svdquant_linear(comfy_linear1: nn.Linear, comfy_linear2: nn.Linear, 
     """
     assert comfy_linear1.in_features == comfy_linear2.in_features
     assert comfy_linear1.bias is None and comfy_linear2.bias is None
+
     torch_dtype = kwargs.pop("torch_dtype", None)
     device = kwargs.pop("device", None)
-    torch_dtype, device = resolve_linear_dtype_device(comfy_linear1, torch_dtype=torch_dtype, device=device)
+
+    torch_dtype, device = resolve_linear_dtype_device(
+        comfy_linear1,
+        torch_dtype=torch_dtype,
+        device=device,
+    )
     svdq_linear = SVDQW4A4Linear(
         comfy_linear1.in_features,
         comfy_linear1.out_features + comfy_linear2.out_features,
@@ -264,14 +277,19 @@ class RopeFuseAttentionHook:
         freqs_cis: torch.Tensor = new_input_args[2]
         if freqs_cis is None:
             return None
-        cache_key = (freqs_cis.data_ptr(), freqs_cis.shape)
+        batch_size = x.shape[0]
+        cache_key = (
+            freqs_cis.data_ptr(),
+            tuple(freqs_cis.shape),
+            batch_size,
+        )
         orig_shape = freqs_cis.shape
         packed_freqs_cis = self.packed_freqs_cis_cache.get(cache_key, None)
         if packed_freqs_cis is None:
             # freqs_cis shape example: torch.Size([1, 4160, 1, 64, 2, 2])
             # freqs_cis dtype: torch.float32
             freqs_cis = freqs_cis[..., [1], :].squeeze(2)  # See comfy.ldm.flux.math#rope, #apply_rope
-            freqs_cis = freqs_cis.expand(x.shape[0], -1, -1, -1, -1)  # [b, s, 64, 1, 2]
+            freqs_cis = freqs_cis.expand(batch_size, -1, -1, -1, -1)  # [b, s, 64, 1, 2]
             freqs_cis = freqs_cis.flatten(0, 1)  # [b*s, 64, 1, 2]
             freqs_cis = freqs_cis.unsqueeze(0)  # [1, b*s, 64, 1, 2]
             packed_freqs_cis = pack_rotemb(pad_tensor(freqs_cis, 256, 1))
